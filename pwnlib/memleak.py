@@ -1,6 +1,17 @@
-from .util.packing import pack, unpack
-from .log import getLogger
+from __future__ import absolute_import
+
+import ctypes
+import functools
+import string
+
+from pwnlib.context import context
+from pwnlib.log import getLogger
+from pwnlib.util.packing import pack
+from pwnlib.util.packing import unpack
+
 log = getLogger(__name__)
+
+__all__ = ['MemLeak', 'RelativeMemLeak']
 
 class MemLeak(object):
     """MemLeak is a caching and heuristic tool for exploiting memory leaks.
@@ -24,38 +35,98 @@ class MemLeak(object):
 
     Example:
 
-        .. doctest:: leaker
+        >>> import pwnlib
+        >>> binsh = pwnlib.util.misc.read('/bin/sh')
+        >>> @pwnlib.memleak.MemLeak
+        ... def leaker(addr):
+        ...     print "leaking 0x%x" % addr
+        ...     return binsh[addr:addr+4]
+        >>> leaker.s(0)[:4]
+        leaking 0x0
+        leaking 0x4
+        '\\x7fELF'
+        >>> leaker[:4]
+        '\\x7fELF'
+        >>> hex(leaker.d(0))
+        '0x464c457f'
+        >>> hex(leaker.clearb(1))
+        '0x45'
+        >>> hex(leaker.d(0))
+        leaking 0x1
+        '0x464c457f'
+        >>> @pwnlib.memleak.MemLeak
+        ... def leaker_nonulls(addr):
+        ...     print "leaking 0x%x" % addr
+        ...     if addr & 0xff == 0:
+        ...         return None
+        ...     return binsh[addr:addr+4]
+        >>> leaker_nonulls.d(0) == None
+        leaking 0x0
+        True
+        >>> leaker_nonulls[0x100:0x104] == binsh[0x100:0x104]
+        leaking 0x100
+        leaking 0xff
+        leaking 0x103
+        True
 
-            >>> import pwnlib
-            >>> binsh = pwnlib.util.misc.read('/bin/sh')
-            >>> @pwnlib.memleak.MemLeak
-            ... def leaker(addr):
-            ...     print "leaking 0x%x" % addr
-            ...     return binsh[addr:addr+4]
-            >>> leaker.s(0)[:4]
-            leaking 0x0
-            leaking 0x4
-            '\\x7fELF'
-            >>> hex(leaker.d(0))
-            '0x464c457f'
-            >>> hex(leaker.clearb(1))
-            '0x45'
-            >>> hex(leaker.d(0))
-            leaking 0x1
-            '0x464c457f'
+        >>> memory = {-4+i: c for i,c in enumerate('wxyzABCDE')}
+        >>> def relative_leak(index):
+        ...     return memory.get(index, None)
+        >>> leak = pwnlib.memleak.MemLeak(relative_leak, relative = True)
+        >>> leak[-1:2]
+        'zAB'
     """
-    def __init__(self, f, search_range = 20, reraise = True):
+    def __init__(self, f, search_range = 20, reraise = True, relative = False):
         self.leak = f
         self.search_range = search_range
         self.reraise = reraise
+        self.relative = relative
 
         # Map of address: byte for all bytes received
         self.cache = {}
 
-    def field(self, address, obj):
-        """call(address, field) => int or str
+        functools.update_wrapper(self, f)
 
-        Leak an entire structure, or structure field.
+    def __repr__(self):
+        return "%s.%s(%r, search_range=%i, reraise=%s)" % (
+            self.__class__.__module__,
+            self.__class__.__name__,
+            self.leak,
+            self.search_range,
+            self.reraise
+        )
+
+    def __call__(self, *a, **kw):
+        return self.leak(*a, **kw)
+
+    def struct(self, address, struct):
+        """struct(address, struct) => structure object
+        Leak an entire structure.
+        Arguments:
+            address(int):  Addess of structure in memory
+            struct(class): A ctypes structure to be instantiated with leaked data
+        Return Value:
+            An instance of the provided struct class, with the leaked data decoded
+
+        Examples:
+
+            >>> @pwnlib.memleak.MemLeak
+            ... def leaker(addr):
+            ...     return "A"
+            >>> e = leaker.struct(0, pwnlib.elf.Elf32_Phdr)
+            >>> hex(e.p_paddr)
+            '0x41414141'
+
+        """
+        size = ctypes.sizeof(struct)
+        data = self.n(address, size)
+        obj = struct.from_buffer_copy(data)
+        return obj
+
+    def field(self, address, obj):
+        """field(address, field) => a structure field.
+
+        Leak a field from a structure.
 
         Arguments:
             address(int): Base address to calculate offsets from
@@ -68,7 +139,34 @@ class MemLeak(object):
         size   = obj.size
         offset = obj.offset
         data   = self.n(address + offset, size)
+        if not data:
+            return None
         return unpack(data, size*8)
+
+    def field_compare(self, address, obj, expected):
+        """field_compare(address, field, expected) ==> bool
+
+        Leak a field from a structure, with an expected value.
+        As soon as any mismatch is found, stop leaking the structure.
+
+        Arguments:
+            address(int): Base address to calculate offsets from
+            field(obj):   Instance of a ctypes field
+            expected(int,str): Expected value
+
+        Return Value:
+            The type of the return value will be dictated by
+            the type of ``field``.
+        """
+        if not isinstance(expected, (int, str)):
+            raise TypeError("Expected value must be an int or str")
+
+        if isinstance(expected, int):
+            expected = pack(expected, bytes=obj.size)
+
+        assert obj.size == len(expected)
+
+        return self.compare(address + obj.offset, expected)
 
     def _leak(self, addr, n, recurse=True):
         """_leak(addr, n) => str
@@ -76,8 +174,11 @@ class MemLeak(object):
         Leak ``n`` consecutive bytes starting at ``addr``.
 
         Returns:
-            A string of length ``n``, or ``None``.
+            A string of length ``n``, or :const:`None`.
         """
+        if not self.relative and addr < 0:
+            return None
+
         addresses = [addr+i for i in xrange(n)]
 
         for address in addresses:
@@ -93,24 +194,19 @@ class MemLeak(object):
                 if self.reraise:
                     raise
 
+            if data:
+                for i,byte in enumerate(data):
+                    self.cache[address+i] = byte
+
             # We could not leak this particular byte, search backwardd
             # to see if another request will satisfy it
-            if not data and recurse:
+            elif recurse:
                 for i in range(1, self.search_range):
-                    data = self._leak(address-i, i, False)
-                    if data in self.cache:
+                    data = self._leak(address-i, i+1, False)
+                    if address in self.cache:
                         break
                 else:
                     return None
-
-            # Could not receive any data, even overlapped with previous
-            # requests.
-            if not data:
-                return None
-
-            # Fill cache for as many bytes as we received
-            for i,byte in enumerate(data):
-                self.cache[address+i] = byte
 
         # Ensure everything is in the cache
         if not all(a in self.cache for a in addresses):
@@ -123,7 +219,7 @@ class MemLeak(object):
         """raw(addr, numb) -> list
 
         Leak `numb` bytes at `addr`"""
-        return map(self._leak, range(addr, addr+numb))
+        return map(lambda a: self._leak(a, 1), range(addr, addr+numb))
 
 
     def _b(self, addr, ndx, size):
@@ -210,6 +306,13 @@ class MemLeak(object):
             True
         """
         return self._b(addr, ndx, 8)
+
+    def p(self, addr, ndx = 0):
+        """p(addr, ndx = 0) -> int
+
+        Leak a pointer-width value at ``((void**) addr)[ndx]``
+        """
+        return self._b(addr, ndx, context.bytes)
 
     def s(self, addr):
         r"""s(addr) -> str
@@ -422,3 +525,110 @@ class MemLeak(object):
 
         for i,b in enumerate(val):
             self.cache[addr+i] = b
+
+    def __getitem__(self, item):
+        if isinstance(item, slice):
+            start = item.start or 0
+            stop  = item.stop
+            step  = item.step
+        else:
+            start, stop, step = (item, item+1, 1)
+
+        if None in (stop, start):
+            log.error("Cannot perform unbounded leaks")
+
+        return self.n(start, stop-start)[::step]
+
+    def compare(self, address, bytes):
+        for i, byte in enumerate(bytes):
+            if self.n(address + i, 1) != byte:
+                return False
+        return True
+
+    @staticmethod
+    def NoNulls(function):
+        """Wrapper for leak functions such that addresses which contain NULL
+        bytes are not leaked.
+
+        This is useful if the address which is used for the leak is read in via
+        a string-reading function like ``scanf("%s")`` or smilar.
+        """
+
+        @functools.wraps(function, updated=[])
+        def null_wrapper(address, *a, **kw):
+            if '\x00' in pack(address):
+                log.info('Ignoring leak request for %#x: Contains NULL bytes' % address)
+                return None
+            return function(address, *a, **kw)
+
+        return MemLeak(null_wrapper)
+
+    @staticmethod
+    def NoWhitespace(function):
+        """Wrapper for leak functions such that addresses which contain whitespace
+        bytes are not leaked.
+
+        This is useful if the address which is used for the leak is read in via
+        e.g. ``scanf()``.
+        """
+
+        @functools.wraps(function, updated=[])
+        def whitespace_wrapper(address, *a, **kw):
+            if set(pack(address)) & set(string.whitespace):
+                log.info('Ignoring leak request for %#x: Contains whitespace' % address)
+                return None
+            return function(address, *a, **kw)
+
+        return MemLeak(whitespace_wrapper)
+
+    @staticmethod
+    def NoNewlines(function):
+        """Wrapper for leak functions such that addresses which contain newline
+        bytes are not leaked.
+
+        This is useful if the address which is used for the leak is provided by
+        e.g. ``fgets()``.
+        """
+
+        @functools.wraps(function, updated=[])
+        def whitespace_wrapper(address, *a, **kw):
+            if '\n' in pack(address):
+                log.info('Ignoring leak request for %#x: Contains newlines' % address)
+                return None
+            return function(address, *a, **kw)
+
+        return MemLeak(whitespace_wrapper)
+
+    @staticmethod
+    def String(function):
+        """Wrapper for leak functions which leak strings, such that a NULL
+        terminator is automaticall added.
+
+        This is useful if the data leaked is printed out as a NULL-terminated
+        string, via e.g. ``printf()``.
+        """
+
+        @functools.wraps(function, updated=[])
+        def string_wrapper(address, *a, **kw):
+            result = function(address, *a, **kw)
+            if isinstance(result, (str, bytes)):
+                result += '\x00'
+            return result
+
+        return MemLeak(string_wrapper)
+
+    # Aliases for convenience
+    u64 = q
+    u32 = d
+    u16 = w
+    u8 = b
+
+    p64 = setq
+    p32 = setd
+    p16 = setw
+    p8 = setb
+
+class RelativeMemLeak(MemLeak):
+    def __init__(self, *a, **kw):
+        kw.setdefault('relative', True)
+        super(RelativeMemLeak, self).__init__(*a, **kw)

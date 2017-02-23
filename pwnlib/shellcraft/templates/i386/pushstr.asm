@@ -1,4 +1,7 @@
-<% from pwnlib.util import lists, packing, fiddling %>\
+<%
+    from pwnlib.util import lists, packing, fiddling
+    from pwnlib.shellcraft import pretty, okay
+%>
 <%page args="string, append_null = True"/>
 <%docstring>
 Pushes a string onto the stack without using
@@ -39,7 +42,7 @@ Example:
         xor dword ptr [esp], 0x10101c2
     >>> print shellcraft.i386.pushstr('\xc3', append_null = False).rstrip()
         /* push '\xc3' */
-        push 0x...c3
+        push -0x3d
     >>> with context.local():
     ...    context.arch = 'i386'
     ...    print enhex(asm(shellcraft.pushstr("/bin/sh")))
@@ -58,29 +61,29 @@ Args:
   append_null (bool): Whether to append a single NULL-byte before pushing.
 </%docstring>
 <%
-    if append_null:
-        string += '\x00'
-    if not string:
-        return
+original = string
+string   = packing.flat(string)
 
-    def okay(s):
-        return '\n' not in s and '\0' not in s
+if append_null:
+    string += '\x00'
+    if isinstance(original, str):
+        original += '\x00'
 
-    if ord(string[-1]) >= 128:
-        extend = '\xff'
-    else:
-        extend = '\x00'
+if not string:
+    return
 
-    def pretty(n):
-        return hex(n & (2 ** 32 - 1))
+if ord(string[-1]) >= 128:
+    extend = '\xff'
+else:
+    extend = '\x00'
 %>\
-    /* push ${repr(string)} */
+    /* push ${pretty(original, False)} */
 % for word in lists.group(4, string, 'fill', extend)[::-1]:
 <%
-    sign = packing.u32(word, 'little', 'signed')
+    sign = packing.u32(word, endian='little', sign='signed')
 %>\
 % if sign in [0, 0xa]:
-    push ${sign + 1}
+    push ${pretty(sign + 1)}
     dec byte ptr [esp]
 % elif -0x80 <= sign <= 0x7f and okay(word[0]):
     push ${pretty(sign)}
@@ -89,8 +92,8 @@ Args:
 % else:
 <%
     a,b = fiddling.xor_pair(word, avoid = '\x00\n')
-    a   = packing.u32(a, 'little', 'unsigned')
-    b   = packing.u32(b, 'little', 'unsigned')
+    a   = packing.u32(a, endian='little', sign='unsigned')
+    b   = packing.u32(b, endian='little', sign='unsigned')
 %>\
     push ${pretty(a)}
     xor dword ptr [esp], ${pretty(b)}

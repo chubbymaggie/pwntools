@@ -1,6 +1,10 @@
-from . import term, text
-from . import keymap as km
-from . import keyconsts as kc
+from __future__ import absolute_import
+
+from pwnlib.term import keyconsts as kc
+from pwnlib.term import keymap as km
+from pwnlib.term import term
+from pwnlib.term import text
+
 cursor = text.reverse
 
 buffer_left, buffer_right = u'', u''
@@ -48,7 +52,7 @@ def fmt_suggestions(suggestions):
                     s += fmt % suggestions[l]
             s += '\n'
     else:
-        s = '\n'
+        s = '(no completions)\n'
     return s
 
 def auto_complete(*_):
@@ -136,7 +140,7 @@ def cancel_search(*_):
 
 def commit_search():
     global search_idx
-    if search_idx is not None:
+    if search_idx is not None and search_results:
         set_buffer(history[search_results[search_idx][0]], u'')
         search_idx = None
         redisplay()
@@ -401,7 +405,7 @@ def readline(_size = None, prompt = '', float = True, priority = 10):
 def init():
     # defer imports until initialization
     import sys, __builtin__
-    from ..util import safeeval
+    from pwnlib.util import safeeval
 
     class Wrapper:
         def __init__(self, fd):

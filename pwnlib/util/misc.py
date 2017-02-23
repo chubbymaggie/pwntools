@@ -1,6 +1,17 @@
-import socket, re, os, stat, errno, string, base64
-from . import lists
-from ..log import getLogger
+import base64
+import errno
+import os
+import platform
+import re
+import socket
+import stat
+import string
+
+from pwnlib.context import context
+from pwnlib.log import getLogger
+from pwnlib.util import fiddling
+from pwnlib.util import lists
+
 log = getLogger(__name__)
 
 def align(alignment, x):
@@ -40,14 +51,15 @@ def binary_ip(host):
     return socket.inet_aton(socket.gethostbyname(host))
 
 
-def size(n, abbriv = 'B', si = False):
-    """size(n, abbriv = 'B', si = False) -> str
+def size(n, abbrev = 'B', si = False):
+    """size(n, abbrev = 'B', si = False) -> str
 
     Convert the length of a bytestream to human readable form.
 
     Arguments:
-      n(int,str): The length to convert to human readable form
-      abbriv(str):
+      n(int,iterable): The length to convert to human readable form,
+        or an object which can have ``len()`` called on it.
+      abbrev(str): String appended to the size, defaults to ``'B'``.
 
     Example:
         >>> size(451)
@@ -56,47 +68,62 @@ def size(n, abbriv = 'B', si = False):
         '1000B'
         >>> size(1024)
         '1.00KB'
+        >>> size(1024, ' bytes')
+        '1.00K bytes'
         >>> size(1024, si = True)
         '1.02KB'
         >>> [size(1024 ** n) for n in range(7)]
         ['1B', '1.00KB', '1.00MB', '1.00GB', '1.00TB', '1.00PB', '1024.00PB']
+        >>> size([])
+        '0B'
+        >>> size([1,2,3])
+        '3B'
     """
-    if isinstance(n, str):
+    if hasattr(n, '__len__'):
         n = len(n)
 
     base = 1000.0 if si else 1024.0
     if n < base:
-        return '%d%s' % (n, abbriv)
+        return '%d%s' % (n, abbrev)
 
     for suffix in ['K', 'M', 'G', 'T']:
         n /= base
         if n < base:
-            return '%.02f%s%s' % (n, suffix, abbriv)
+            return '%.02f%s%s' % (n, suffix, abbrev)
 
-    return '%.02fP%s' % (n / base, abbriv)
+    return '%.02fP%s' % (n / base, abbrev)
 
+KB = 1024
+MB = 1024 * KB
+GB = 1024 * MB
 
-def read(path):
-    """read(path) -> str
+KiB = 1000
+MiB = 1000 * KB
+GiB = 1000 * MB
+
+def read(path, count=-1, skip=0):
+    r"""read(path, count=-1, skip=0) -> str
 
     Open file, return content.
 
     Examples:
-        >>> read('pwnlib/util/misc.py').split('\\n')[0]
-        'import socket, re, os, stat, errno, string, base64'
+        >>> read('/proc/self/exe')[:4]
+        '\x7fELF'
     """
     path = os.path.expanduser(os.path.expandvars(path))
     with open(path) as fd:
-        return fd.read()
+        if skip:
+            fd.seek(skip)
+        return fd.read(count)
 
 
-def write(path, data = '', create_dir = False):
+def write(path, data = '', create_dir = False, mode = 'w'):
     """Create new file or truncate existing to zero length and write data."""
     path = os.path.expanduser(os.path.expandvars(path))
     if create_dir:
         path = os.path.realpath(path)
         mkdir_p(os.path.dirname(path))
-    with open(path, 'w') as f:
+    with open(path, mode) as f:
         f.write(data)
 
 def which(name, all = False):
@@ -120,6 +147,10 @@ def which(name, all = False):
       >>> which('sh')
       '/bin/sh'
 """
+    # If name is a path, do not attempt to resolve it.
+    if os.path.sep in name:
+        return name
+
     isroot = os.getuid() == 0
     out = set()
     try:
@@ -150,41 +181,76 @@ def run_in_new_terminal(command, terminal = None, args = None):
 
     Run a command in a new terminal.
 
-    If X11 is detected, the terminal will be launched with
-    ``x-terminal-emulator``.
-
-    If X11 is not detected, a new tmux pane is opened if possible.
+    When ``terminal`` is not set:
+        - If ``context.terminal`` is set it will be used.
+          If it is an iterable then ``context.terminal[1:]`` are default arguments.
+        - If a ``pwntools-terminal`` command exists in ``$PATH``, it is used
+        - If ``$TERM_PROGRAM`` is set, that is used.
+        - If X11 is detected (by the presence of the ``$DISPLAY`` environment
+          variable), ``x-terminal-emulator`` is used.
+        - If tmux is detected (by the presence of the ``$TMUX`` environment
+          variable), a new pane will be opened.
 
     Arguments:
-      command (str): The command to run.
-      terminal (str): Which terminal to use.
-      args (list): Arguments to pass to the terminal
+        command (str): The command to run.
+        terminal (str): Which terminal to use.
+        args (list): Arguments to pass to the terminal
+
+    Note:
+        The command is opened with ``/dev/null`` for stdin, stdout, stderr.
 
     Returns:
-      None
+      PID of the new terminal process
     """
 
     if not terminal:
-        if 'XAUTHORITY' in os.environ:
+        if context.terminal:
+            terminal = context.terminal[0]
+            args     = context.terminal[1:]
+        elif which('pwntools-terminal'):
+            terminal = 'pwntools-terminal'
+            args     = []
+        elif 'DISPLAY' in os.environ:
             terminal = 'x-terminal-emulator'
             args     = ['-e']
-
         elif 'TMUX' in os.environ:
             terminal = 'tmux'
             args     = ['splitw']
 
     if not terminal:
-        log.error('could not find terminal: %s' % terminal)
+        log.error('Argument `terminal` is not set, and could not determine a default')
 
-    argv    = [which(terminal)] + args + [command]
+    terminal_path = which(terminal)
+
+    if not terminal_path:
+        log.error('Could not find terminal: %s' % terminal)
+
+    argv = [terminal_path] + args
+
+    if isinstance(command, str):
+        if ';' in command:
+            log.error("Cannot use commands with semicolon.  Create a script and invoke that directly.")
+        argv += [command]
+    elif isinstance(command, (list, tuple)):
+        if any(';' in c for c in command):
+            log.error("Cannot use commands with semicolon.  Create a script and invoke that directly.")
+        argv += list(command)
+
     log.debug("Launching a new terminal: %r" % argv)
 
-    if os.fork() == 0:
-        os.close(0)
-        os.close(1)
-        os.close(2)
+    pid = os.fork()
+
+    if pid == 0:
+        # Closing the file descriptors makes everything fail under tmux on OSX.
+        if platform.system() != 'Darwin':
+            devnull = open(os.devnull, 'rwb')
+            os.dup2(devnull.fileno(), 0)
+            os.dup2(devnull.fileno(), 1)
+            os.dup2(devnull.fileno(), 2)
         os.execv(argv[0], argv)
         os._exit(1)
+
+    return pid
 
 def parse_ldd_output(output):
     """Parses the output from a run of 'ldd' on a binary.
@@ -228,70 +294,33 @@ def mkdir_p(path):
         else:
             raise
 
-def sh_string(s):
-    """Outputs a string in a format that will be understood by /bin/sh.
-
-    If the string does not contain any bad characters, it will simply be
-    returned, possibly with quotes. If it contains bad characters, it will
-    be escaped in a way which is compatible with most known systems.
-
-    Examples:
-
-        >>> print sh_string('foobar')
-        foobar
-        >>> print sh_string('foo bar')
-        'foo bar'
-        >>> print sh_string("foo'bar")
-        "foo'bar"
-        >>> print sh_string("foo\\\\bar")
-        'foo\\bar'
-        >>> print sh_string("foo\\\\'bar")
-        "foo\\\\'bar"
-        >>> print sh_string("foo\\x01'bar")
-        "$( (echo Zm9vASdiYXI=|(base64 -d||openssl enc -d -base64)||echo -en 'foo\\x01\\x27bar') 2>/dev/null)"
-        >>> print subprocess.check_output("echo -n " + sh_string("foo\\\\'bar"), shell = True)
-        foo\\'bar
+def dealarm_shell(tube):
+    """Given a tube which is a shell, dealarm it.
     """
+    tube.clean()
 
-    very_good = set(string.ascii_letters + string.digits)
-    good      = (very_good | set(string.punctuation + ' ')) - set("'")
-    alt_good  = (very_good | set(string.punctuation + ' ')) - set('!')
+    tube.sendline('which python || echo')
+    if tube.recvline().startswith('/'):
+        tube.sendline('''exec python -c "import signal, os; signal.alarm(0); os.execl('$SHELL','')"''')
+        return tube
 
-    if '\x00' in s:
-        log.error("sh_string(): Cannot create a null-byte")
+    tube.sendline('which perl || echo')
+    if tube.recvline().startswith('/'):
+        tube.sendline('''exec perl -e "alarm 0; exec '${SHELL:-/bin/sh}'"''')
+        return tube
 
-    if all(c in very_good for c in s):
-        return s
-    elif all(c in good for c in s):
-        return "'%s'" % s
-    elif all(c in alt_good for c in s):
-        fixed = ''
-        for c in s:
-            if c in '"\\$`':
-                fixed += '\\' + c
-            else:
-                fixed += c
-        return '"%s"' % fixed
-    else:
-        fixed = ''
-        for c in s:
-            if c == '\\':
-                fixed += '\\\\'
-            elif c in good:
-                fixed += c
-            else:
-                fixed += '\\x%02x' % ord(c)
-        return '"$( (echo %s|(base64 -d||openssl enc -d -base64)||echo -en \'%s\') 2>/dev/null)"' % (base64.b64encode(s), fixed)
+    return None
 
 def register_sizes(regs, in_sizes):
     """Create dictionaries over register sizes and relations
 
     Given a list of lists of overlapping register names (e.g. ['eax','ax','al','ah']) and a list of input sizes,
     it returns the following:
-      * all_regs    : list of all valid registers
-      * sizes[reg]  : the size of reg in bits
-      * bigger[reg] : list of overlapping registers bigger than reg
-      * smaller[reg]: list of overlapping registers smaller than reg
+
+    * all_regs    : list of all valid registers
+    * sizes[reg]  : the size of reg in bits
+    * bigger[reg] : list of overlapping registers bigger than reg
+    * smaller[reg]: list of overlapping registers smaller than reg
 
     Used in i386/AMD64 shellcode, e.g. the mov-shellcode.
 

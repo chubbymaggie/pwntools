@@ -2,6 +2,8 @@
 *.hi
 *.pyc
 *~
+*.swp
+.ropeproject
 *.pdf
 */auto/*
 */bin/*
@@ -9,4 +11,7 @@ docs/build
 build
 MANIFEST
 dist
-pwntools.egg-info
+*.egg-info
+*.core
+.coverage
+.tox

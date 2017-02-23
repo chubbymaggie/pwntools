@@ -1,5 +1,10 @@
-from . import readline
+from __future__ import absolute_import
+
+import os
 import re
+
+from pwnlib.term import readline
+
 
 class Completer:
     def complete(self, _left, _right):
@@ -76,7 +81,6 @@ class LongestPrefixCompleter(WordCompleter):
         else:
             return cs
 
-import os
 class PathCompleter(Completer):
     def __init__(self, mask = '*', only_dirs = False):
         if mask != '*':
@@ -103,7 +107,7 @@ class PathCompleter(Completer):
         if os.path.isdir(dirname):
             try:
                 names = os.listdir(dirname)
-            except:
+            except Exception:
                 return
             names = [n for n in names if n.startswith(basename)]
             dirname = os.path.dirname(prefix)

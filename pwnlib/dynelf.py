@@ -47,15 +47,22 @@ Example
 
 DynELF
 """
-from . import elf
-from .elf     import ELF, constants
-from .memleak import MemLeak
-from .context import context
-from .log     import getLogger
+from __future__ import absolute_import
+
+import ctypes
 
 from elftools.elf.enums import ENUM_D_TAG
 
-import ctypes
+from pwnlib import elf
+from pwnlib import libcdb
+from pwnlib.context import context
+from pwnlib.elf import ELF
+from pwnlib.elf import constants
+from pwnlib.log import getLogger
+from pwnlib.memleak import MemLeak
+from pwnlib.util.fiddling import enhex
+from pwnlib.util.packing import unpack
+from pwnlib.util.web import wget
 
 log    = getLogger(__name__)
 sizeof = ctypes.sizeof
@@ -134,7 +141,8 @@ class DynELF(object):
     .. _SYSV:      https://refspecs.linuxbase.org/elf/gabi4+/ch5.dynamic.html#hash
     .. _GNU:       https://blogs.oracle.com/ali/entry/gnu_hash_elf_sections
     .. _DT_DEBUG:  https://reverseengineering.stackexchange.com/questions/6525/elf-link-map-when-linked-as-relro
-    .. _link map:  https://google.com
+    .. _link map:  https://sourceware.org/git/?p=glibc.git;a=blob;f=elf/link.h;h=eaca8028e45a859ac280301a6e955a14eed1b887;hb=HEAD#l84
+    .. _DT_PLTGOT: http://refspecs.linuxfoundation.org/ELF/zSeries/lzsabi0_zSeries/x2251.html
     '''
 
     def __init__(self, leak, pointer=None, elf=None):
@@ -162,6 +170,10 @@ class DynELF(object):
         if not isinstance(leak, MemLeak):
             leak = MemLeak(leak)
 
+        if not elf:
+            log.warn_once("No ELF provided.  Leaking is much faster if you have a copy of the ELF being leaked.")
+
+        self.elf     = elf
         self.leak    = leak
         self.libbase = self._find_base(pointer or elf.address)
 
@@ -220,20 +232,29 @@ class DynELF(object):
             elf = ELF(path)
         elf.address = self.libbase
 
-        self.waitfor("Loading from %r" % elf.path)
+        w = self.waitfor("Loading from %r" % elf.path)
+
+        # Save our real leaker
+        real_leak = self.leak
 
         # Create a fake leaker which just leaks out of the 'loaded' ELF
+        # However, we may load things which are outside of the ELF (e.g.
+        # the linkmap or GOT) so we need to fall back on the real leak.
         @MemLeak
         def fake_leak(address):
-            data = elf.read(address, 4)
-            return data
+            try:
+                return elf.read(address, 4)
+            except ValueError:
+                return real_leak.b(address)
 
         # Save off our real leaker, use the fake leaker
-        real_leak = self.leak
         self.leak = fake_leak
 
         # Get useful pointers for resolving the linkmap faster
+        w.status("Searching for DT_PLTGOT")
         pltgot = self._find_dt(constants.DT_PLTGOT)
+
+        w.status("Searching for DT_DEBUG")
         debug  = self._find_dt(constants.DT_DEBUG)
 
         # Restore the real leaker
@@ -251,9 +272,19 @@ class DynELF(object):
         w = None
 
         while True:
-            if self.leak.b(ptr) == 0x7f and self.leak.n(ptr+1,3) == 'ELF':
+            if self.leak.compare(ptr, '\x7fELF'):
                 break
+
+            # See if we can short circuit the search
+            fast = self._find_base_optimized(ptr)
+            if fast:
+                ptr = fast
+                continue
+
             ptr -= page_size
+
+            if ptr < 0:
+                raise ValueError("Address is negative, something is wrong!")
 
             # Defer creating the spinner in the event that 'ptr'
             # is already the base address
@@ -266,6 +297,33 @@ class DynELF(object):
 
         return ptr
 
+    def _find_base_optimized(self, ptr):
+        if not self.elf:
+            return None
+
+        # If we have an ELF< we can probably speed this up a little bit?
+        # Note that we add +0x20 onto the offset in order to avoid needing
+        # to leak any bytes which contain '\r\n\t\b '
+        ptr += 0x20
+        data = self.leak.n(ptr, 32)
+        if not data:
+            return None
+
+        # Do not permit multiple matches
+        matches = list(self.elf.search(data))
+        if len(matches) != 1:
+            return None
+
+        candidate = matches[0]
+        candidate -= self.elf.address
+
+        # The match should have the same page-alignment as our leaked data.
+        if candidate & 0xfff != 0x20:
+            return None
+
+        # Adjust based on the original pointer we got, and the ELF's address.
+        ptr -= candidate
+        return ptr
 
     def _find_dynamic_phdr(self):
         """
@@ -288,7 +346,7 @@ class DynELF(object):
         self.status("PT_DYNAMIC count = %#x" % phnum)
 
         for i in range(phnum):
-            if leak.field(phead, Phdr.p_type) == constants.PT_DYNAMIC:
+            if leak.field_compare(phead, Phdr.p_type, constants.PT_DYNAMIC):
                 break
             phead += sizeof(Phdr)
         else:
@@ -304,43 +362,34 @@ class DynELF(object):
 
         return dynamic
 
-    def _find_dt(self, tags):
+    def _find_dt(self, tag):
         """
         Find an entry in the DYNAMIC array.
 
         Arguments:
-            tags(int, tuple): Single tag, or list of tags to search for
+            tag(int): Single tag to find
 
         Returns:
             Pointer to the data described by the specified entry.
         """
-        if not isinstance(tags, (list, tuple)):
-            tags = [tags]
-
         leak    = self.leak
         base    = self.libbase
         dynamic = self.dynamic
-        name    = lambda tag: next(k for k,v in ENUM_D_TAG.items() if v == tag)
+        name    = next(k for k,v in ENUM_D_TAG.items() if v == tag)
 
         Dyn = {32: elf.Elf32_Dyn,    64: elf.Elf64_Dyn}     [self.elfclass]
 
         # Found the _DYNAMIC program header, now find PLTGOT entry in it
         # An entry with a DT_NULL tag marks the end of the DYNAMIC array.
-        while True:
-            d_tag = leak.field(dynamic, Dyn.d_tag)
-
-            if d_tag == constants.DT_NULL:
-                return None
-            elif d_tag in tags:
+        while not leak.field_compare(dynamic, Dyn.d_tag, constants.DT_NULL):
+            if leak.field_compare(dynamic, Dyn.d_tag, tag):
                 break
-
-            #Skip to next
             dynamic += sizeof(Dyn)
         else:
-            self.failure("Could not find any of: " % map(name, tags))
+            self.failure("Could not find tag %s" % name)
             return None
 
-        self.status("Found %s at %#x" % (name(d_tag), dynamic))
+        self.status("Found %s at %#x" % (name, dynamic))
         ptr = leak.field(dynamic, Dyn.d_ptr)
 
         # Sometimes this is an offset rather than an actual pointer.
@@ -368,7 +417,10 @@ class DynELF(object):
         r_debug = {32: elf.Elf32_r_debug, 64: elf.Elf64_r_debug}[self.elfclass]
 
         result = None
-        pltgot = pltgot or self._find_dt(constants.DT_PLTGOT)
+
+        if not pltgot:
+            w.status("Finding linkmap: DT_PLTGOT")
+            pltgot = self._find_dt(constants.DT_PLTGOT)
 
         if pltgot:
             w.status("GOT.linkmap")
@@ -419,6 +471,37 @@ class DynELF(object):
         else:
             self._waitfor.status(msg)
 
+    @property
+    def libc(self):
+        """libc(self) -> ELF
+
+        Leak the Build ID of the remote libc.so, download the file,
+        and load an ``ELF`` object with the correct base address.
+
+        Returns:
+            An ELF object, or None.
+        """
+        libc = 'libc.so'
+
+        with self.waitfor('Downloading libc'):
+            dynlib = self._dynamic_load_dynelf(libc)
+
+            self.status("Trying lookup based on Build ID")
+            build_id = dynlib._lookup_build_id(libc)
+
+            if not build_id:
+                return None
+
+            self.status("Trying lookup based on Build ID: %s" % build_id)
+            path = libcdb.search_by_build_id(build_id)
+
+            if not path:
+                return None
+
+            libc = ELF(path)
+            libc.address = dynlib.libbase
+            return libc
+
     def lookup (self, symb = None, lib = None):
         """lookup(symb = None, lib = None) -> int
 
@@ -431,8 +514,9 @@ class DynELF(object):
               If set to ``'libc'``, ``'libc.so'`` is assumed.
 
         Returns:
-            Address of the named symbol, or ``None``.
+            Address of the named symbol, or :const:`None`.
         """
+        result = None
 
         if lib == 'libc':
             lib = 'libc.so'
@@ -443,7 +527,7 @@ class DynELF(object):
         if symb and lib:
             pretty = '%r in %r' % (symb, lib)
         else:
-            pretty = symb or lib
+            pretty = repr(symb or lib)
 
         if not pretty:
             self.failure("Must specify a library or symbol")
@@ -454,14 +538,35 @@ class DynELF(object):
         # If we are loading from a different library, create
         # a DynELF instance for it.
         #
-        if lib: dynlib = self._dynamic_load_dynelf(lib)
+        if lib is not None: dynlib = self._dynamic_load_dynelf(lib)
         else:   dynlib = self
+
+        if dynlib is None:
+            log.failure("Could not find %r" % lib)
+            return None
 
         #
         # If we are resolving a symbol in the library, find it.
         #
-        if symb: result = dynlib._lookup(symb)
-        else:    result = dynlib.libbase
+        if symb:
+            # Try a quick lookup by build ID
+            self.status("Trying lookup based on Build ID")
+            build_id = dynlib._lookup_build_id(lib=lib)
+            result   = None
+            if build_id:
+                log.info("Trying lookup based on Build ID: %s" % build_id)
+                path = libcdb.search_by_build_id(build_id)
+                if path:
+                    with context.local(log_level='error'):
+                        e = ELF(path)
+                        e.address = dynlib.libbase
+                        result = e.symbols[symb]
+
+            if not result:
+                self.status("Trying remote lookup")
+                result = dynlib._lookup(symb)
+        else:
+            result = dynlib.libbase
 
         #
         # Did we win?
@@ -481,11 +586,18 @@ class DynELF(object):
             LinkMap = {32: elf.Elf32_Link_Map, 64: elf.Elf64_Link_Map}[self.elfclass]
 
             cur = self.link_map
+
+            # make sure we rewind to the beginning!
+            while leak.field(cur, LinkMap.l_prev):
+                cur = leak.field(cur, LinkMap.l_prev)
+
             while cur:
                 p_name = leak.field(cur, LinkMap.l_name)
                 name   = leak.s(p_name)
                 addr   = leak.field(cur, LinkMap.l_addr)
                 cur    = leak.field(cur, LinkMap.l_next)
+
+                log.debug('Found %r @ %#x' % (name, addr))
 
                 self._bases[name] = addr
 
@@ -506,6 +618,10 @@ class DynELF(object):
         leak    = self.leak
         LinkMap = {32: elf.Elf32_Link_Map, 64: elf.Elf64_Link_Map}[self.elfclass]
 
+        # make sure we rewind to the beginning!
+        while leak.field(cur, LinkMap.l_prev):
+            cur = leak.field(cur, LinkMap.l_prev)
+
         while cur:
             self.status("link_map entry %#x" % cur)
             p_name = leak.field(cur, LinkMap.l_name)
@@ -524,7 +640,7 @@ class DynELF(object):
 
         libbase = leak.field(cur, LinkMap.l_addr)
 
-        self.status("Resolved library at %#x" % libbase)
+        self.status("Resolved library %r at %#x" % (libname, libbase))
 
         lib = DynELF(leak, libbase)
         lib._dynamic = leak.field(cur, LinkMap.l_ld)
@@ -590,12 +706,12 @@ class DynELF(object):
         leak       = self.leak
         Sym        = {32: elf.Elf32_Sym, 64: elf.Elf64_Sym}[self.elfclass]
 
-        nbuckets   = leak.field(hshtab, elf.Elf_HashTable.nbuckets)
+        nbucket   = leak.field(hshtab, elf.Elf_HashTable.nbucket)
         bucketaddr = hshtab + sizeof(elf.Elf_HashTable)
-        chain      = bucketaddr + (nbuckets * 4)
+        chain      = bucketaddr + (nbucket * 4)
 
         self.status('hashmap')
-        hsh = sysv_hash(symb) % nbuckets
+        hsh = sysv_hash(symb) % nbucket
 
         # Get the index out of the bucket for the hash we computed
         idx = leak.d(bucketaddr, hsh)
@@ -707,3 +823,53 @@ class DynELF(object):
         else:
             self.failure('Could not find a GNU hash that matched %#x' % hsh)
             return None
+
+    def _lookup_build_id(self, lib = None):
+
+        libbase = self.libbase
+
+        if lib is not None:
+            libbase = self.lookup(symb = None, lib = lib)
+
+        if not libbase:
+            self.status("Couldn't find libc base")
+            return None
+
+        for offset in libcdb.get_build_id_offsets():
+            address = libbase + offset
+            if self.leak.compare(address + 0xC, "GNU\x00"):
+                return enhex(''.join(self.leak.raw(address + 0x10, 20)))
+            else:
+                self.status("Magic did not match")
+                pass
+
+    def stack(self):
+        """Finds a pointer to the stack via __environ, which is an exported
+        symbol in libc, which points to the environment block.
+        """
+        symbols = ['environ', '_environ', '__environ']
+
+        for symbol in symbols:
+            environ = self.lookup(symbol, 'libc')
+
+            if environ:
+                break
+        else:
+            log.error("Could not find the stack")
+
+        stack = self.leak.p(environ)
+
+        self.success('*environ: %#x' % stack)
+
+        return stack
+
+    def heap(self):
+        """Finds the beginning of the heap via __curbrk, which is an exported
+        symbol in the linker, which points to the current brk.
+        """
+        curbrk = self.lookup('__curbrk', 'libc')
+        brk    = self.leak.p(curbrk)
+
+        self.success('*curbrk: %#x' % brk)
+
+        return brk

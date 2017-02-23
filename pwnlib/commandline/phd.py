@@ -1,11 +1,19 @@
 #!/usr/bin/env python2
+from __future__ import absolute_import
 
-import argparse, sys, os
-import pwnlib.term.text as text
-from pwnlib.util.fiddling import hexdump_iter
+import argparse
+import os
+import sys
 
-parser = argparse.ArgumentParser(
-    description = 'Pwnlib HexDump'
+import pwnlib
+pwnlib.args.free_form = False
+
+from pwn import *
+from pwnlib.commandline import common
+
+parser = common.parser_commands.add_parser(
+    'phd',
+    help = 'Pwnlib HexDump'
 )
 
 parser.add_argument(
@@ -63,9 +71,7 @@ def asint(s):
     else:
         return int(s, 10)
 
-def main():
-    args = parser.parse_args()
-
+def main(args):
     infile = args.file
     width  = asint(args.width)
     skip   = asint(args.skip)
@@ -82,8 +88,6 @@ def main():
         else:
             infile.seek(skip, os.SEEK_CUR)
 
-    data = infile.read(count)
-
     hl = []
     if args.highlight:
         for hs in args.highlight:
@@ -91,9 +95,10 @@ def main():
                 hl.append(asint(h))
 
     try:
-        for line in hexdump_iter(data, width, highlight = hl, begin = offset + skip):
+        for line in hexdump_iter(infile, width, highlight = hl, begin = offset + skip):
             print line
     except (KeyboardInterrupt, IOError):
         pass
 
-if __name__ == '__main__': main()
+if __name__ == '__main__':
+    pwnlib.commandline.common.main(__file__)

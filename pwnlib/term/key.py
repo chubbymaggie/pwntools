@@ -1,11 +1,20 @@
+from __future__ import absolute_import
+
+import errno
+import os
+import select
+import string
+import sys
+
+from pwnlib.term import keyconsts as kc
+from pwnlib.term import termcap
+
 __all__ = ['getch', 'getraw', 'get', 'unget']
 
-import select, sys, string, os, errno
-from . import termcap
-from . import keyconsts as kc
+
 
 try:    _fd = sys.stdin.fileno()
-except: _fd = file('/dev/null', 'r').fileno()
+except Exception: _fd = file('/dev/null', 'r').fileno()
 
 def getch(timeout = 0):
     while True:
@@ -83,6 +92,9 @@ class Matcher:
             return self.__call__(other)
         else:
             return False
+
+    def __neq__(self, other):
+        return not self == other
 
     def __hash__(self):
         return self._hash
@@ -412,7 +424,7 @@ def _peek_simple():
                 k = Key(kc.TYPE_KEYSYM, kc.KEY_BACKSPACE)
             elif c0 == 9:
                 k = Key(kc.TYPE_KEYSYM, kc.KEY_TAB)
-            elif c0 == 13:
+            elif c0 in (10, 13):
                 k = Key(kc.TYPE_KEYSYM, kc.KEY_ENTER)
             else:
                 k = Key(kc.TYPE_UNICODE)

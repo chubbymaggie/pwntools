@@ -1,8 +1,12 @@
 """Silly module mostly meant as an easter-egg."""
+from __future__ import absolute_import
 
-from .. import term
-from ..term import text
-import time, threading
+import threading
+import time
+
+from pwnlib import term
+from pwnlib.term import text
+
 
 _banner = r'''
   .:*~*:._.:*~*:._.:*~*:._.:*~*:._.:*~*:._.:*~*:._.:*~*:._.:*~*:._.:*~*:.

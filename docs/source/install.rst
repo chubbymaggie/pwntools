@@ -20,27 +20,23 @@ following system libraries installed.
 Released Version
 -----------------
 
-Pwntools is available as a ``pip`` package.
+pwntools is available as a ``pip`` package.
 
 .. code-block:: bash
 
-    $ apt-get install python2.7 python2.7-dev python-pip
-    $ pip install pwntools
+    $ apt-get update
+    $ apt-get install python2.7 python-pip python-dev git libssl-dev libffi-dev build-essential
+    $ pip install --upgrade pip
+    $ pip install --upgrade pwntools
 
-Latest Version
+Development
 --------------
 
-Alternatively if you prefer to use the latest version from the
-repository:
+If you are hacking on Pwntools locally, you'll want to do something like this:
 
 .. code-block:: bash
 
     $ git clone https://github.com/Gallopsled/pwntools
-    $ cd pwntools
-    $ pip install -e .
+    $ pip install --upgrade --editable ./pwntools
 
 .. _Ubuntu: https://launchpad.net/~pwntools/+archive/ubuntu/binutils
-.. _libcapstone 2.1: http://www.capstone-engine.org
-.. _i386: http://www.capstone-engine.org/download/2.1.2/capstone-2.1.2_i386.deb
-.. _amd64: http://www.capstone-engine.org/download/2.1.2/capstone-2.1.2_amd64.deb
-

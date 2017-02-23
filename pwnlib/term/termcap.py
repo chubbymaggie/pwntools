@@ -1,11 +1,18 @@
 __all__ = ['get']
-import os, curses
+import curses
+import os
+import sys
 
 cache = None
+
 def get(cap, *args, **kwargs):
     default = kwargs.pop('default', '')
 
     if 'PWNLIB_NOTERM' in os.environ:
+        return ''
+
+    # Hack for readthedocs.org
+    if 'READTHEDOCS' in os.environ:
         return ''
 
     if kwargs != {}:
@@ -36,6 +43,10 @@ def init():
     global cache
 
     if 'PWNLIB_NOTERM' not in os.environ:
-        curses.setupterm()
+        # Fix for BPython
+        try:
+            curses.setupterm()
+        except:
+            pass
 
     cache = {}

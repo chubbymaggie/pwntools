@@ -1,5 +1,14 @@
-from . import key, readline, text, termcap, keymap, term
+from __future__ import absolute_import
+
 import sys
+
+from pwnlib.term import completer
+from pwnlib.term import key
+from pwnlib.term import keymap
+from pwnlib.term import readline
+from pwnlib.term import term
+from pwnlib.term import termcap
+from pwnlib.term import text
 
 # Re-exports (XXX: Are these needed?)
 output = term.output
@@ -17,7 +26,7 @@ def can_init():
     ``pwnlib`` manage the terminal.
     """
 
-    if not sys.stderr.isatty():
+    if not sys.stdout.isatty():
         return False
 
     # Check for python -i
@@ -70,9 +79,5 @@ def init():
     update_geometry()
     term.on_winch.append(update_geometry)
     readline.init()
-
-    # the logging module has an old reference to sys.stderr, so lets update that
-    from ..log import _console
-    _console.stream = sys.stderr
 
     term_mode = True
