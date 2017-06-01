@@ -20,6 +20,7 @@ from pwnlib.log import getLogger
 from pwnlib.qemu import get_qemu_user
 from pwnlib.timeout import Timeout
 from pwnlib.tubes.tube import tube
+from pwnlib.util.hashes import sha256file
 from pwnlib.util.misc import parse_ldd_output
 from pwnlib.util.misc import which
 
@@ -550,7 +551,7 @@ class process(tube):
         elif os.path.sep not in executable:
             tmp = executable
             executable = os.path.join(cwd, executable)
-            log.warn_once("Could not find executable %r in $PATH, using %r instead" % (tmp, executable))
+            self.warn_once("Could not find executable %r in $PATH, using %r instead" % (tmp, executable))
 
         if not os.path.exists(executable):
             self.error("%r does not exist"  % executable)
@@ -902,9 +903,6 @@ class process(tube):
         If the process is dead, attempts to locate the coredump created
         by the kernel.
         """
-        if self._corefile is not None:
-            return self._corefile
-
         # If the process is still alive, try using GDB
         import pwnlib.elf.corefile
         import pwnlib.gdb
@@ -917,7 +915,14 @@ class process(tube):
             self.warn("Could not find core file for pid %i" % self.pid)
             return
 
+        core_hash = sha256file(finder.core_path)
+
+        if self._corefile and self._corefile._hash == core_hash:
+            return self._corefile
+
         self._corefile = pwnlib.elf.corefile.Corefile(finder.core_path)
+        self._corefile._hash = core_hash
+
         return self._corefile
 
     def leak(self, address, count=1):

@@ -351,7 +351,7 @@ class ContextType(object):
         'os': 'linux',
         'proxy': None,
         'signed': False,
-        'terminal': None,
+        'terminal': tuple(),
         'timeout': Timeout.maximum,
     }
 
@@ -1131,7 +1131,7 @@ class ContextType(object):
             self.os = device.os or self.os
         elif isinstance(device, str):
             device = Device(device)
-        else:
+        elif device is not None:
             raise AttributeError("device must be either a Device object or a serial number as a string")
 
         return device
@@ -1359,7 +1359,7 @@ def update_context_defaults(section):
         if key not in ContextType.defaults:
             log.warn("Unknown configuration option %r in section %r" % (key, 'context'))
             continue
-        if isinstance(ContextType.defaults[key], (str, unicode)):
+        if isinstance(ContextType.defaults[key], (str, unicode, tuple)):
             value = safeeval.expr(value)
 
         ContextType.defaults[key] = value
